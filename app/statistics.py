@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import itertools
 import math
-from collections.abc import Iterable
+import secrets
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,25 +13,27 @@ from app.schemas import Candidate, CandidateLane, Diagnostic, DrawRecord
 
 
 @dataclass
-class ProbabilityResult:
-    probabilities: np.ndarray
+class AuditResult:
     windows: list[int]
-    validated_signal: bool
+    anomaly_detected: bool
     uniformity_p_value: float
     entropy_ratio: float
     mean_abs_lag1: float
 
 
 class StatisticalPredictor:
-    """Regularized, walk-forward validated statistics for candidate ranking.
+    """Audit historical randomness, then generate strictly equal-probability tickets.
 
-    The model intentionally shrinks estimates toward the uniform draw mechanism.
-    Historical signals receive material weight only when their past one-step-ahead
-    Brier loss beats the uniform baseline with positive paired evidence.
+    Historical draws are never used to increase or decrease a legal number's sampling
+    weight. They only feed descriptive tests for uniformity and serial dependence.
+    This separation prevents an exploratory anomaly from being misrepresented as a
+    repeatable forecasting edge.
     """
 
     PRIOR_STRENGTH = 45.0
-    MAX_ENUMERATED_COMBINATIONS = 80_000
+
+    def __init__(self) -> None:
+        self.random = secrets.SystemRandom()
 
     def predict(
         self,
@@ -42,16 +43,17 @@ class StatisticalPredictor:
         candidate_count: int = 3,
     ) -> tuple[list[Candidate], Diagnostic]:
         if len(draws) < 30:
-            raise ValueError("至少需要30期有效历史数据才能进行统计计算")
+            raise ValueError("至少需要30期有效历史数据才能进行随机性审计")
         if spec.model_kind == "set":
-            candidates, results = self._predict_set(spec, play, draws, candidate_count)
+            candidates, audits = self._predict_set(spec, play, draws, candidate_count)
         else:
-            candidates, results = self._predict_ordered(spec, play, draws, candidate_count)
-        p_values = [result.uniformity_p_value for result in results]
-        entropies = [result.entropy_ratio for result in results]
-        correlations = [result.mean_abs_lag1 for result in results]
-        windows = sorted({window for result in results for window in result.windows})
-        validated = any(result.validated_signal for result in results)
+            candidates, audits = self._predict_ordered(spec, play, draws, candidate_count)
+
+        p_values = [audit.uniformity_p_value for audit in audits]
+        entropies = [audit.entropy_ratio for audit in audits]
+        correlations = [audit.mean_abs_lag1 for audit in audits]
+        windows = sorted({window for audit in audits for window in audit.windows})
+        anomaly = any(audit.anomaly_detected for audit in audits)
         latest = draws[-1]
         diagnostic = Diagnostic(
             sample_size=len(draws),
@@ -61,11 +63,12 @@ class StatisticalPredictor:
             uniformity_p_value=round(float(min(p_values)), 6),
             entropy_ratio=round(float(np.mean(entropies)), 6),
             mean_abs_lag1_correlation=round(float(np.mean(correlations)), 6),
-            validated_signal=validated,
+            validated_signal=anomaly,
             validation_note=(
-                "至少一个滚动窗口在时序回测中显示出正向证据，仍不代表未来优势。"
-                if validated
-                else "滚动窗口未稳定击败等概率基线，候选已强制向均匀分布收缩。"
+                "历史样本出现需要复核的统计偏离；它可能来自随机波动、规则变化或数据质量，"
+                "不进入选号权重，也不代表下一期可预测。"
+                if anomaly
+                else "历史样本未显示稳定偏离；无论审计结果如何，所有合法单注仍按理论等概率生成。"
             ),
         )
         return candidates, diagnostic
@@ -76,60 +79,35 @@ class StatisticalPredictor:
         play: PlaySpec,
         draws: list[DrawRecord],
         candidate_count: int,
-    ) -> tuple[list[Candidate], list[ProbabilityResult]]:
-        lane_candidates: list[list[tuple[tuple[int, ...], float]]] = []
-        results: list[ProbabilityResult] = []
-        matrices: list[np.ndarray] = []
-        for lane in spec.lanes:
-            matrix = self._set_matrix(draws, lane)
-            result = self._fit_probability_model(matrix, lane.draw_count / lane.pool_size)
-            ticket_count = play.ticket_size or lane.ticket_count
-            combinations = self._rank_set_combinations(
-                result.probabilities,
-                matrix,
-                ticket_count,
-                seed=f"{spec.id}:{play.id}:{draws[-1].issue}:{lane.key}",
-            )
-            lane_candidates.append(combinations)
-            results.append(result)
-            matrices.append(matrix)
-
-        combined: list[Candidate] = []
-        selected_signatures: list[tuple[tuple[int, ...], ...]] = []
-        search_depth = min(40, min(len(items) for items in lane_candidates))
-        pool: list[tuple[float, tuple[tuple[int, ...], ...]]] = []
-        if len(lane_candidates) == 1:
-            pool = [(score, (numbers,)) for numbers, score in lane_candidates[0][:400]]
-        else:
-            for indexes in itertools.product(range(search_depth), repeat=len(lane_candidates)):
-                selections = tuple(lane_candidates[i][index][0] for i, index in enumerate(indexes))
-                score = sum(lane_candidates[i][index][1] for i, index in enumerate(indexes))
-                pool.append((score, selections))
-            pool.sort(key=lambda item: item[0], reverse=True)
-
-        for raw_score, signature in pool:
-            if not self._is_diverse_set(signature, selected_signatures):
-                continue
-            selected_signatures.append(signature)
-            combined.append(
-                Candidate(
-                    rank=len(combined) + 1,
-                    score_index=0.0,
-                    lanes=[
-                        CandidateLane(
-                            key=lane.key,
-                            label=lane.label,
-                            color=lane.color,
-                            numbers=[f"{number + 1:02d}" for number in signature[index]],
-                        )
-                        for index, lane in enumerate(spec.lanes)
-                    ],
+    ) -> tuple[list[Candidate], list[AuditResult]]:
+        audits = [self._audit_matrix(self._set_matrix(draws, lane)) for lane in spec.lanes]
+        signatures: set[tuple[tuple[int, ...], ...]] = set()
+        candidates: list[Candidate] = []
+        attempts = 0
+        while len(candidates) < candidate_count and attempts < 1000:
+            attempts += 1
+            lanes: list[CandidateLane] = []
+            signature: list[tuple[int, ...]] = []
+            for lane in spec.lanes:
+                ticket_count = play.ticket_size or lane.ticket_count
+                numbers = tuple(
+                    sorted(self.random.sample(range(1, lane.pool_size + 1), ticket_count))
                 )
-            )
-            combined[-1].score_index = self._score_index(raw_score, pool[0][0], len(combined))
-            if len(combined) >= candidate_count:
-                break
-        return combined, results
+                signature.append(numbers)
+                lanes.append(
+                    CandidateLane(
+                        key=lane.key,
+                        label=lane.label,
+                        color=lane.color,
+                        numbers=[f"{number:02d}" for number in numbers],
+                    )
+                )
+            frozen_signature = tuple(signature)
+            if frozen_signature in signatures:
+                continue
+            signatures.add(frozen_signature)
+            candidates.append(Candidate(rank=len(candidates) + 1, score_index=100.0, lanes=lanes))
+        return candidates, audits
 
     def _predict_ordered(
         self,
@@ -137,89 +115,78 @@ class StatisticalPredictor:
         play: PlaySpec,
         draws: list[DrawRecord],
         candidate_count: int,
-    ) -> tuple[list[Candidate], list[ProbabilityResult]]:
+    ) -> tuple[list[Candidate], list[AuditResult]]:
         values = np.asarray([draw.numbers[: len(spec.position_pool_sizes)] for draw in draws])
-        position_probabilities: list[np.ndarray] = []
-        results: list[ProbabilityResult] = []
+        audits = []
         for position, pool_size in enumerate(spec.position_pool_sizes):
             matrix = np.eye(pool_size, dtype=float)[values[:, position]]
-            result = self._fit_probability_model(matrix, 1.0 / pool_size)
-            position_probabilities.append(result.probabilities)
-            results.append(result)
+            audits.append(self._audit_matrix(matrix))
 
-        if play.id in {"group3", "group6"}:
-            ranked = self._rank_grouped_digits(position_probabilities, play.id)
-            minimum_distance = 1
+        if play.id == "group3":
+            population = [
+                tuple(sorted((repeated, repeated, other)))
+                for repeated in range(10)
+                for other in range(10)
+                if repeated != other
+            ]
+            selections = self.random.sample(population, candidate_count)
+        elif play.id == "group6":
+            population = list(itertools.combinations(range(10), 3))
+            selections = self.random.sample(population, candidate_count)
         else:
-            ranked = self._beam_sequences(position_probabilities, 5000)
-            minimum_distance = max(1, len(position_probabilities) // 3)
-
-        selected: list[tuple[int, ...]] = []
-        candidates: list[Candidate] = []
-        for numbers, score in ranked:
-            if any(self._hamming(numbers, existing) < minimum_distance for existing in selected):
-                continue
-            selected.append(numbers)
-            candidates.append(
-                Candidate(
-                    rank=len(candidates) + 1,
-                    score_index=self._score_index(score, ranked[0][1], len(candidates) + 1),
-                    lanes=[
-                        CandidateLane(
-                            key="digits",
-                            label="号码",
-                            color="violet",
-                            numbers=[str(number) for number in numbers],
-                        )
-                    ],
+            unique: set[tuple[int, ...]] = set()
+            while len(unique) < candidate_count:
+                unique.add(
+                    tuple(
+                        self.random.randrange(pool_size) for pool_size in spec.position_pool_sizes
+                    )
                 )
-            )
-            if len(candidates) >= candidate_count:
-                break
-        return candidates, results
+            selections = list(unique)
 
-    def _fit_probability_model(
-        self, matrix: np.ndarray, baseline_probability: float
-    ) -> ProbabilityResult:
+        candidates = [
+            Candidate(
+                rank=index + 1,
+                score_index=100.0,
+                lanes=[
+                    CandidateLane(
+                        key="digits",
+                        label="号码",
+                        color="violet",
+                        numbers=[str(number) for number in numbers],
+                    )
+                ],
+            )
+            for index, numbers in enumerate(selections)
+        ]
+        return candidates, audits
+
+    def _audit_matrix(self, matrix: np.ndarray) -> AuditResult:
         n, dimension = matrix.shape
+        row_total = float(np.mean(matrix.sum(axis=1)))
+        baseline_probability = row_total / dimension
         baseline = np.full(dimension, baseline_probability, dtype=float)
         possible_windows = [30, 100, 300, 1000]
         windows = sorted({min(n, window) for window in possible_windows if min(n, window) >= 20})
         evaluation_start = max(20, n - min(180, n // 3))
-        accepted: list[tuple[np.ndarray, float]] = []
+        anomaly_detected = False
 
         for window in windows:
-            losses = []
-            baseline_losses = []
+            differences = []
             for index in range(evaluation_start, n):
                 start = max(0, index - window)
-                train = matrix[start:index]
-                estimate = self._posterior(train, baseline)
-                losses.append(float(np.mean((matrix[index] - estimate) ** 2)))
-                baseline_losses.append(float(np.mean((matrix[index] - baseline) ** 2)))
-            differences = np.asarray(baseline_losses) - np.asarray(losses)
-            mean_difference = float(np.mean(differences)) if len(differences) else 0.0
-            standard_error = (
-                float(np.std(differences, ddof=1) / math.sqrt(len(differences)))
-                if len(differences) > 1
-                else math.inf
-            )
-            z_score = mean_difference / standard_error if standard_error > 0 else 0.0
-            estimate = self._posterior(matrix[-window:], baseline)
-            if mean_difference > 0 and z_score > 1.28:
-                accepted.append((estimate, min(4.0, z_score)))
+                estimate = self._posterior(matrix[start:index], baseline)
+                model_loss = float(np.mean((matrix[index] - estimate) ** 2))
+                baseline_loss = float(np.mean((matrix[index] - baseline) ** 2))
+                differences.append(baseline_loss - model_loss)
+            paired = np.asarray(differences)
+            if len(paired) > 2:
+                mean_difference = float(np.mean(paired))
+                standard_error = float(np.std(paired, ddof=1) / math.sqrt(len(paired)))
+                z_score = mean_difference / standard_error if standard_error > 0 else 0.0
+                # This is an audit flag only. A stricter 99% one-sided threshold reduces
+                # false discoveries across multiple exploratory windows.
+                anomaly_detected = anomaly_detected or (mean_difference > 0 and z_score > 2.326)
 
-        validated = bool(accepted)
-        if accepted:
-            total_weight = sum(weight for _, weight in accepted)
-            evidence = sum(estimate * weight for estimate, weight in accepted) / total_weight
-            probabilities = 0.55 * baseline + 0.45 * evidence
-        else:
-            fallback = self._posterior(matrix[-min(n, 300) :], baseline)
-            shrinkage = min(0.14, n / (n + 7000.0))
-            probabilities = (1.0 - shrinkage) * baseline + shrinkage * fallback
-
-        probabilities = np.clip(probabilities, 1e-9, 1 - 1e-9)
         counts = matrix.sum(axis=0)
         expected = np.full(dimension, counts.sum() / dimension)
         p_value = float(chisquare(counts, expected).pvalue) if expected[0] > 0 else 1.0
@@ -233,10 +200,9 @@ class StatisticalPredictor:
                 right = matrix[1:, column]
                 if np.std(left) > 0 and np.std(right) > 0:
                     lag1_values.append(abs(float(np.corrcoef(left, right)[0, 1])))
-        return ProbabilityResult(
-            probabilities=probabilities,
+        return AuditResult(
             windows=windows,
-            validated_signal=validated,
+            anomaly_detected=anomaly_detected,
             uniformity_p_value=p_value,
             entropy_ratio=entropy_ratio,
             mean_abs_lag1=float(np.mean(lag1_values)) if lag1_values else 0.0,
@@ -256,111 +222,3 @@ class StatisticalPredictor:
                 if 1 <= number <= lane.pool_size:
                     matrix[row, number - 1] = 1.0
         return matrix
-
-    def _rank_set_combinations(
-        self,
-        probabilities: np.ndarray,
-        matrix: np.ndarray,
-        ticket_count: int,
-        seed: str,
-    ) -> list[tuple[tuple[int, ...], float]]:
-        pool_size = len(probabilities)
-        cap = min(pool_size, max(ticket_count + 8, 16 if ticket_count >= 5 else 12))
-        ranked_numbers = sorted(
-            range(pool_size),
-            key=lambda index: (probabilities[index], self._tie_break(seed, index)),
-            reverse=True,
-        )[:cap]
-        while math.comb(len(ranked_numbers), ticket_count) > self.MAX_ENUMERATED_COMBINATIONS:
-            ranked_numbers.pop()
-
-        pair_scores = self._pair_scores(matrix)
-        ranked: list[tuple[tuple[int, ...], float]] = []
-        for combination in itertools.combinations(ranked_numbers, ticket_count):
-            number_score = sum(math.log(probabilities[index]) for index in combination)
-            pair_score = sum(
-                pair_scores[left, right] for left, right in itertools.combinations(combination, 2)
-            )
-            jitter = self._combination_jitter(seed, combination)
-            ranked.append((tuple(sorted(combination)), number_score + 0.035 * pair_score + jitter))
-        ranked.sort(key=lambda item: item[1], reverse=True)
-        return ranked
-
-    @staticmethod
-    def _pair_scores(matrix: np.ndarray) -> np.ndarray:
-        n = max(len(matrix), 1)
-        frequencies = matrix.mean(axis=0)
-        observed = matrix.T @ matrix
-        expected = np.outer(frequencies, frequencies) * n
-        scores = np.log((observed + 2.0) / (expected + 2.0))
-        np.fill_diagonal(scores, 0.0)
-        return np.clip(scores, -0.35, 0.35)
-
-    def _rank_grouped_digits(
-        self, probabilities: list[np.ndarray], play_id: str
-    ) -> list[tuple[tuple[int, ...], float]]:
-        ranked = []
-        for combination in itertools.combinations_with_replacement(range(10), 3):
-            counts = sorted({combination.count(value) for value in combination}, reverse=True)
-            if play_id == "group3" and counts != [2, 1]:
-                continue
-            if play_id == "group6" and len(set(combination)) != 3:
-                continue
-            permutations = set(itertools.permutations(combination))
-            probability = sum(
-                math.prod(probabilities[position][value] for position, value in enumerate(order))
-                for order in permutations
-            )
-            ranked.append((combination, math.log(max(probability, 1e-12))))
-        ranked.sort(key=lambda item: item[1], reverse=True)
-        return ranked
-
-    @staticmethod
-    def _beam_sequences(
-        probabilities: list[np.ndarray], beam_size: int
-    ) -> list[tuple[tuple[int, ...], float]]:
-        beam: list[tuple[tuple[int, ...], float]] = [((), 0.0)]
-        for position_probabilities in probabilities:
-            expanded = [
-                (prefix + (number,), score + math.log(max(float(probability), 1e-12)))
-                for prefix, score in beam
-                for number, probability in enumerate(position_probabilities)
-            ]
-            expanded.sort(key=lambda item: item[1], reverse=True)
-            beam = expanded[:beam_size]
-        return beam
-
-    @staticmethod
-    def _hamming(left: Iterable[int], right: Iterable[int]) -> int:
-        return sum(a != b for a, b in zip(left, right, strict=True))
-
-    @staticmethod
-    def _is_diverse_set(
-        signature: tuple[tuple[int, ...], ...],
-        existing: list[tuple[tuple[int, ...], ...]],
-    ) -> bool:
-        for other in existing:
-            too_similar = True
-            for current_lane, other_lane in zip(signature, other, strict=True):
-                allowed_overlap = max(0, len(current_lane) - 1)
-                if len(set(current_lane) & set(other_lane)) <= allowed_overlap:
-                    too_similar = False
-                    break
-            if too_similar:
-                return False
-        return True
-
-    @staticmethod
-    def _tie_break(seed: str, value: int) -> float:
-        digest = hashlib.sha256(f"{seed}:{value}".encode()).digest()
-        return int.from_bytes(digest[:8], "big") / 2**64
-
-    @staticmethod
-    def _combination_jitter(seed: str, values: tuple[int, ...]) -> float:
-        digest = hashlib.sha256(f"{seed}:{values}".encode()).digest()
-        return (int.from_bytes(digest[:4], "big") / 2**32) * 1e-9
-
-    @staticmethod
-    def _score_index(score: float, best_score: float, rank: int) -> float:
-        relative = math.exp(min(0.0, score - best_score))
-        return round(max(72.0, min(99.0, 96.0 * relative - (rank - 1) * 1.7)), 1)

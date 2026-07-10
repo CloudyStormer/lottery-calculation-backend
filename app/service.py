@@ -69,8 +69,9 @@ class LotteryService:
         spec = self.game(game_id)
         play = self.play(spec, play_id)
         warnings = [
-            "开奖结果具有随机性，统计候选不构成中奖承诺或投资建议。",
-            "候选评分是模型内部相对指数，不是中奖概率。",
+            "每期开奖相互独立，历史结果不会改变下一期任何合法单注的理论概率。",
+            "彩票长期期望由各玩法返奖结构决定；奖金计提比例不等于个人返还率。",
+            "候选仅为等概率随机样本，不构成中奖预测、承诺或投资建议。",
         ]
         cached_count = self.store.count(game_id)
         if refresh or cached_count < 100:
@@ -89,6 +90,7 @@ class LotteryService:
             game_name=spec.name,
             play_id=play.id,
             play_name=play.name,
+            theoretical_odds=play.odds_text,
             generated_at=datetime.now(timezone.utc),
             candidates=candidates,
             diagnostic=diagnostic,
@@ -97,11 +99,11 @@ class LotteryService:
             else "中国福利彩票发行管理中心官网",
             official_url=spec.official_url,
             methodology=[
-                "30/100/300/1000期多尺度滚动窗口",
-                "贝叶斯先验收缩，防止把短期冷热误判为规律",
-                "严格按时间顺序的一步向前Brier损失回测",
+                "按官方规则精确计算组合样本空间与单注理论概率",
+                "30/100/300/1000期窗口仅用于随机性审计",
                 "卡方均匀性、信息熵与滞后一阶相关诊断",
-                "组合共现项正则化与候选多样性约束",
+                "严格时序Brier损失检验历史模型是否只是过拟合",
+                "使用系统加密安全随机源，对所有合法单注等概率抽样",
             ],
             warnings=warnings,
         )

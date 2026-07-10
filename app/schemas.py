@@ -48,6 +48,7 @@ class GenerateResponse(BaseModel):
     game_name: str
     play_id: str
     play_name: str
+    theoretical_odds: str
     generated_at: datetime
     candidates: list[Candidate]
     diagnostic: Diagnostic
