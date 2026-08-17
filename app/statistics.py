@@ -11,6 +11,13 @@ from scipy.stats import chisquare
 from app.catalog import GameSpec, LaneSpec, PlaySpec
 from app.schemas import Candidate, CandidateLane, Diagnostic, DrawRecord
 
+QXC_MAX_COVERAGE_ALGORITHM = "qxc-coverage-v1"
+QXC_MAX_COVERAGE_TICKET_COUNT = 3
+QXC_MAX_COVERAGE_OUTCOME_COUNT = 3_569_880
+QXC_OUTCOME_SPACE = 15_000_000
+QXC_MAX_COVERAGE_PROBABILITY = QXC_MAX_COVERAGE_OUTCOME_COUNT / QXC_OUTCOME_SPACE
+QXC_RANDOM_THREE_COVERAGE_PROBABILITY = 0.2250133656
+
 
 @dataclass
 class AuditResult:
@@ -133,6 +140,14 @@ class StatisticalPredictor:
         elif play.id == "group6":
             population = list(itertools.combinations(range(10), 3))
             selections = self.random.sample(population, candidate_count)
+        elif (
+            spec.id == "qxc"
+            and play.id == "basic"
+            and candidate_count == QXC_MAX_COVERAGE_TICKET_COUNT
+        ):
+            selections = self._sample_position_distinct_tickets(
+                spec.position_pool_sizes, candidate_count
+            )
         else:
             unique: set[tuple[int, ...]] = set()
             while len(unique) < candidate_count:
@@ -159,6 +174,30 @@ class StatisticalPredictor:
             for index, numbers in enumerate(selections)
         ]
         return candidates, audits
+
+    def _sample_position_distinct_tickets(
+        self,
+        position_pool_sizes: tuple[int, ...],
+        candidate_count: int,
+    ) -> list[tuple[int, ...]]:
+        """Coordinate tickets for maximum joint coverage without biasing any ticket.
+
+        Each position is sampled without replacement across the three tickets.  The
+        ordered sample makes every ticket's value uniform at that position, while the
+        position-wise independence keeps every individual full ticket uniform over the
+        legal 7-star space.  The tickets are dependent only to reduce overlap between
+        their any-prize winning regions.
+        """
+        if candidate_count > min(position_pool_sizes):
+            raise ValueError("候选注数超过了至少一个位置的可用号码数")
+        numbers_by_position = [
+            self.random.sample(range(pool_size), candidate_count)
+            for pool_size in position_pool_sizes
+        ]
+        return [
+            tuple(position_numbers[rank] for position_numbers in numbers_by_position)
+            for rank in range(candidate_count)
+        ]
 
     def _audit_matrix(self, matrix: np.ndarray) -> AuditResult:
         n, dimension = matrix.shape

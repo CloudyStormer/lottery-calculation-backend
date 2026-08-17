@@ -4,7 +4,12 @@ import numpy as np
 
 from app.catalog import GAMES
 from app.schemas import DrawRecord
-from app.statistics import StatisticalPredictor
+from app.statistics import (
+    QXC_MAX_COVERAGE_ALGORITHM,
+    QXC_MAX_COVERAGE_PROBABILITY,
+    QXC_RANDOM_THREE_COVERAGE_PROBABILITY,
+    StatisticalPredictor,
+)
 
 
 def make_set_draws(game_id: str, count: int = 360) -> list[DrawRecord]:
@@ -90,11 +95,20 @@ def test_qxc_accepts_current_back_number_range_and_generates_legal_tickets() -> 
 
     assert diagnostic.sample_size == len(draws)
     assert len(candidates) == 3
+    tickets = [[int(value) for value in item.lanes[0].numbers] for item in candidates]
     for candidate in candidates:
         numbers = [int(value) for value in candidate.lanes[0].numbers]
         assert len(numbers) == 7
         assert all(0 <= number <= 9 for number in numbers[:6])
         assert 0 <= numbers[-1] <= 14
+    for position in range(7):
+        assert len({ticket[position] for ticket in tickets}) == 3
+
+
+def test_qxc_three_ticket_maximum_coverage_contract() -> None:
+    assert QXC_MAX_COVERAGE_ALGORITHM == "qxc-coverage-v1"
+    assert QXC_MAX_COVERAGE_PROBABILITY == 0.237992
+    assert QXC_MAX_COVERAGE_PROBABILITY > QXC_RANDOM_THREE_COVERAGE_PROBABILITY
 
 
 def test_happy8_respects_selected_ticket_size() -> None:

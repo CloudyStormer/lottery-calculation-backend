@@ -6,7 +6,12 @@ from app.catalog import GAMES, GameSpec, PlaySpec
 from app.config import Settings
 from app.providers import OfficialDataError, OfficialDataProvider
 from app.schemas import GenerateResponse, SyncResponse
-from app.statistics import StatisticalPredictor
+from app.statistics import (
+    QXC_MAX_COVERAGE_ALGORITHM,
+    QXC_MAX_COVERAGE_PROBABILITY,
+    QXC_RANDOM_THREE_COVERAGE_PROBABILITY,
+    StatisticalPredictor,
+)
 from app.storage import DrawStore
 
 
@@ -85,6 +90,28 @@ class LotteryService:
         if len(draws) < 30:
             raise InsufficientDataError("可用历史数据不足30期")
         candidates, diagnostic = self.predictor.predict(spec, play, draws)
+        methodology = [
+            "按官方规则精确计算组合样本空间与单注理论概率",
+            "30/100/300/1000期窗口仅用于随机性审计",
+            "卡方均匀性、信息熵与滞后一阶相关诊断",
+            "严格时序Brier损失检验历史模型是否只是过拟合",
+            "使用系统加密安全随机源，对所有合法单注等概率抽样",
+        ]
+        if spec.id == "qxc" and play.id == "basic":
+            methodology = [
+                f"7星彩三注使用等概率最大覆盖 {QXC_MAX_COVERAGE_ALGORITHM}："
+                "七个对应位置的三个号码全部互异",
+                f"固定三注至少一注中任意奖理论覆盖率为"
+                f"{QXC_MAX_COVERAGE_PROBABILITY:.4%}，普通随机三注约为"
+                f"{QXC_RANDOM_THREE_COVERAGE_PROBABILITY:.4%}",
+                "每张票单独仍在1500万种合法号码中等概率，历史号码不参与加权",
+                "历史窗口只用于随机性审计，不改变生成号码",
+                "使用系统加密安全随机源实现位置内无放回抽样",
+            ]
+            warnings.append(
+                "最大覆盖只把三注至少一注中任意奖的概率提高到23.7992%；"
+                "三注一等奖概率仍为1/5,000,000，期望回报不变。"
+            )
         return GenerateResponse(
             game_id=spec.id,
             game_name=spec.name,
@@ -98,12 +125,6 @@ class LotteryService:
             if spec.provider == "sport"
             else "中国福利彩票发行管理中心官网",
             official_url=spec.official_url,
-            methodology=[
-                "按官方规则精确计算组合样本空间与单注理论概率",
-                "30/100/300/1000期窗口仅用于随机性审计",
-                "卡方均匀性、信息熵与滞后一阶相关诊断",
-                "严格时序Brier损失检验历史模型是否只是过拟合",
-                "使用系统加密安全随机源，对所有合法单注等概率抽样",
-            ],
+            methodology=methodology,
             warnings=warnings,
         )
