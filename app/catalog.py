@@ -127,17 +127,17 @@ GAMES: dict[str, GameSpec] = {
         provider="sport",
         provider_code="04",
         official_url="https://m.lottery.gov.cn/tcwm/qxc/",
-        rule_summary="每位从0—9中选择，共组成一个七位号码。",
+        rule_summary="前六位分别从0—9中选择，最后一位从0—14中选择。",
         lanes=(),
         plays=(
             PlaySpec(
                 "basic",
                 "基本投注",
-                "七个位置按顺序组成投注号码",
-                odds_text="一等奖：1 / 10,000,000",
+                "前六位数字 + 1个0—14后区号码",
+                odds_text="一等奖：1 / (10^6 × 15) = 1 / 15,000,000",
             ),
         ),
-        position_pool_sizes=(10, 10, 10, 10, 10, 10, 10),
+        position_pool_sizes=(10, 10, 10, 10, 10, 10, 15),
         history_note="官方接口可追溯至04101期。",
     ),
     "ssq": GameSpec(

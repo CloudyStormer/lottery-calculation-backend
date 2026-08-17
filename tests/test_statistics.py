@@ -80,6 +80,23 @@ def test_group3_and_group6_constraints() -> None:
     assert all(len(set(candidate.lanes[0].numbers)) == 3 for candidate in group6)
 
 
+def test_qxc_accepts_current_back_number_range_and_generates_legal_tickets() -> None:
+    predictor = StatisticalPredictor()
+    spec = GAMES["qxc"]
+    draws = make_digit_draws("qxc")
+    assert any(draw.numbers[-1] >= 10 for draw in draws)
+
+    candidates, diagnostic = predictor.predict(spec, spec.plays[0], draws)
+
+    assert diagnostic.sample_size == len(draws)
+    assert len(candidates) == 3
+    for candidate in candidates:
+        numbers = [int(value) for value in candidate.lanes[0].numbers]
+        assert len(numbers) == 7
+        assert all(0 <= number <= 9 for number in numbers[:6])
+        assert 0 <= numbers[-1] <= 14
+
+
 def test_happy8_respects_selected_ticket_size() -> None:
     spec = GAMES["kl8"]
     candidates, _ = StatisticalPredictor().predict(spec, spec.plays[4], make_set_draws("kl8"))
